@@ -1,8 +1,8 @@
-name: Update Exchange Rates (3x Hourly Staggered + Anti-Stale)
+name: Update Exchange Rates (3x Hourly Staggered + Quotes)
 
 on:
   schedule:
-    - cron: '3,23,43 * * * *' # 매시 03분(OER 200통화), 23분·43분(TwelveData 16통화) = 시간당 3회 갱신
+    - cron: '3,23,43 * * * *' # 매시 03분(OER 200통화), 23분·43분(TwelveData 16통화 시세+등락률)
   workflow_dispatch:
 
 permissions:
@@ -17,7 +17,7 @@ jobs:
         with:
           fetch-depth: 2
 
-      - name: Fetch staggered rates & 3-year history
+      - name: Fetch staggered rates, daily quotes & 3-year history
         env:
           OER_APP_ID: ${{ secrets.OER_APP_ID }}
           TWELVE_DATA_KEY: ${{ secrets.TWELVE_DATA_KEY }}
@@ -57,7 +57,7 @@ jobs:
             return merged;
           }
 
-          // [1순위] OpenExchangeRates (1시간 주기 · 200개 전체 통화)
+          // [1순위] OpenExchangeRates (1시간 주기 · 200개 전체 통화 + 금 XAU + 비트코인 BTC)
           async function fetchOER() {
             if (!process.env.OER_APP_ID) return null;
             const data = await fetchJsonWithTimeout(
@@ -95,20 +95,38 @@ jobs:
             return null;
           }
 
-          // Twelve Data 8개씩 분할 호출
-          async function fetchTwelveDataBatch(pairs) {
-            const url = `https://api.twelvedata.com/price?symbol=${pairs.join(",")}&apikey=${process.env.TWELVE_DATA_KEY}`;
-            const td = await fetchJsonWithTimeout(url, 8000);
-            const result = {};
-            if (!td) return result;
+          // Twelve Data /quote 8개씩 분할 호출 (동일 1크레딧으로 현재가+전일대비등락률+고가/저가 동시 확보)
+          async function fetchTwelveDataQuoteBatch(pairs) {
+            const url = `https://api.twelvedata.com/quote?symbol=${pairs.join(",")}&apikey=${process.env.TWELVE_DATA_KEY}`;
+            const td = await fetchJsonWithTimeout(url, 10000);
+            const rates = {};
+            const quotes = {};
+            if (!td) return { rates, quotes };
 
             for (const pair of pairs) {
-              const price = parseFloat(td?.[pair]?.price);
+              const item = td?.[pair];
+              const price = parseFloat(item?.close || item?.price);
               if (price && price > 0) {
-                result[pair.split("/")[1]] = price;
+                const cur = pair.split("/")[1];
+                rates[cur] = price;
+
+                const prevClose = parseFloat(item?.previous_close);
+                const change = parseFloat(item?.change);
+                const pct = parseFloat(item?.percent_change);
+                const high = parseFloat(item?.high);
+                const low = parseFloat(item?.low);
+
+                quotes[cur] = {
+                  price,
+                  previous_close: Number.isFinite(prevClose) && prevClose > 0 ? prevClose : null,
+                  change: Number.isFinite(change) ? change : null,
+                  percent_change: Number.isFinite(pct) ? Number(pct.toFixed(4)) : null,
+                  high: Number.isFinite(high) && high > 0 ? high : null,
+                  low: Number.isFinite(low) && low > 0 ? low : null
+                };
               }
             }
-            return result;
+            return { rates, quotes };
           }
 
           // 3년 치 과거 환율 수집 (신규 frankfurter.dev 및 구 frankfurter.app 2중 호출)
@@ -128,11 +146,9 @@ jobs:
               const data = await fetchJsonWithTimeout(url, 15000);
               if (data?.rates && Object.keys(data.rates).length > 100) {
                 fs.writeFileSync("history_3y.json", JSON.stringify(data));
-                console.log("history_3y.json 생성 완료:", Object.keys(data.rates).length, "일치 데이터");
                 return true;
               }
             }
-            console.warn("history_3y.json 수집 실패 - 다음 주기에 재시도합니다.");
             return false;
           }
 
@@ -150,6 +166,8 @@ jobs:
             }
 
             const existingRates = existing?.rates || {};
+            let updatedQuotes = { ...(existing?.quotes || {}) };
+
             const lastOerMs = existing?.meta?.last_oer_at ? Date.parse(existing.meta.last_oer_at) : 0;
             const lastTdMs = existing?.meta?.last_td_at ? Date.parse(existing.meta.last_td_at) : 0;
             const minsSinceOer = (nowMs - lastOerMs) / 60000;
@@ -181,27 +199,30 @@ jobs:
               }
             }
 
-            // [슬롯 B: 매시 23분, 43분] 평일 실시간 16개 핵심 통화 덮어쓰기
+            // [슬롯 B: 매시 23분, 43분] 평일 실시간 16개 핵심 통화 시세 + 등락률 덮어쓰기
             const shouldRunTd = process.env.TWELVE_DATA_KEY && !isWeekend && (isManual || (minsSinceOer >= 12 && minsSinceTd >= 15));
             if (shouldRunTd) {
               const batch1 = ["USD/KRW", "USD/IDR", "USD/JPY", "USD/EUR", "USD/VND", "USD/THB", "USD/CNY", "USD/SGD"];
               const batch2 = ["USD/TWD", "USD/PHP", "USD/MYR", "USD/HKD", "USD/GBP", "USD/AUD", "USD/CAD", "USD/CHF"];
 
-              const r1 = await fetchTwelveDataBatch(batch1);
-              await new Promise(resolve => setTimeout(resolve, 65000));
-              const r2 = await fetchTwelveDataBatch(batch2);
+              const r1 = await fetchTwelveDataQuoteBatch(batch1);
+              await new Promise(resolve => setTimeout(resolve, 65000)); // 분당 8크레딧 제한 초기화 대기
+              const r2 = await fetchTwelveDataQuoteBatch(batch2);
 
-              const tdRates = { ...r1, ...r2 };
-              const tdCount = Object.keys(tdRates).length;
+              const mergedTdRates = { ...r1.rates, ...r2.rates };
+              const mergedTdQuotes = { ...r1.quotes, ...r2.quotes };
+              const tdCount = Object.keys(mergedTdRates).length;
+
               if (tdCount > 0) {
-                updatedRates = safeMergeRates(updatedRates, tdRates, false);
-                realtimeSource = `TwelveData-20m(${tdCount})`;
+                updatedRates = safeMergeRates(updatedRates, mergedTdRates, false);
+                updatedQuotes = { ...updatedQuotes, ...mergedTdQuotes };
+                realtimeSource = `TwelveData-20m-Quote(${tdCount})`;
                 newLastTdAt = now.toISOString();
                 didUpdate = true;
               }
             }
 
-            // 3년 치 과거 차트 데이터 (파일이 없거나, 수동 실행이거나, 매일 UTC 00시 03분대일 때)
+            // 3년 치 과거 차트 데이터
             const hasHistory = fs.existsSync("history_3y.json");
             const isDailyHistorySlot = now.getUTCHours() === 0 && now.getUTCMinutes() < 20;
             if (!hasHistory || isManual || isDailyHistorySlot) {
@@ -225,7 +246,8 @@ jobs:
                   last_oer_at: newLastOerAt,
                   last_td_at: newLastTdAt
                 },
-                rates: updatedRates
+                rates: updatedRates,
+                quotes: updatedQuotes
               };
               fs.writeFileSync("latest.json", JSON.stringify(payload));
             } else {
