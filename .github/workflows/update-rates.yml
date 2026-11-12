@@ -1,8 +1,8 @@
-name: Update Exchange Rates (3x Hourly Staggered + Quotes)
+name: Update Exchange Rates & Core Assets (Official APIs Only)
 
 on:
   schedule:
-    - cron: '3,23,43 * * * *' # 매시 03분(OER 200통화), 23분·43분(TwelveData 16통화 시세+등락률)
+    - cron: '3,23,43 * * * *' # 매시 03분(OER 200통화·귀금속 + ETH), 23분·43분(TwelveData 16통화 실시간·등락률)
   workflow_dispatch:
 
 permissions:
@@ -17,7 +17,7 @@ jobs:
         with:
           fetch-depth: 2
 
-      - name: Fetch staggered rates, daily quotes & 3-year history
+      - name: Fetch FX, metals, core crypto & 3-year history
         env:
           OER_APP_ID: ${{ secrets.OER_APP_ID }}
           TWELVE_DATA_KEY: ${{ secrets.TWELVE_DATA_KEY }}
@@ -26,7 +26,7 @@ jobs:
           node << 'EOF'
           const fs = require("fs");
 
-          // 타임아웃 및 자동 리다이렉트 지원 fetch 헬퍼
+          // 타임아웃 및 자동 리다이렉트 지원 공식 API 호출 헬퍼
           async function fetchJsonWithTimeout(url, timeoutMs = 8000) {
             const controller = new AbortController();
             const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -41,8 +41,8 @@ jobs:
             }
           }
 
-          // 이상치(±25% 급변 오류) 방어 병합
-          function safeMergeRates(baseRates, incomingRates, allowLargeJump = false) {
+          // 이상치 방어 병합 (일반 통화 ±25%, 암호화폐 ±60%)
+          function safeMergeRates(baseRates, incomingRates, allowLargeJump = false, maxSwing = 0.25) {
             const merged = { ...baseRates };
             for (const [cur, val] of Object.entries(incomingRates)) {
               const num = Number(val);
@@ -50,14 +50,14 @@ jobs:
               const prev = merged[cur];
               if (!allowLargeJump && prev > 0) {
                 const ratio = num / prev;
-                if (ratio > 1.25 || ratio < 0.75) continue;
+                if (ratio > 1 + maxSwing || ratio < 1 - maxSwing) continue;
               }
               merged[cur] = num;
             }
             return merged;
           }
 
-          // [1순위] OpenExchangeRates (1시간 주기 · 200개 전체 통화 + 금 XAU + 비트코인 BTC)
+          // [1순위 공식 API] OpenExchangeRates (200개 통화 + 금 XAU + 은 XAG + 백금 XPT + 팔라듐 XPD + BTC)
           async function fetchOER() {
             if (!process.env.OER_APP_ID) return null;
             const data = await fetchJsonWithTimeout(
@@ -69,7 +69,7 @@ jobs:
             return null;
           }
 
-          // [2~4순위 무가입 백업] 24시간 주기
+          // [2~4순위 무가입 공식/오픈 백업] 24시간 주기
           async function fetchKeylessFallback() {
             const er = await fetchJsonWithTimeout("https://open.er-api.com/v6/latest/USD");
             if (er?.rates?.KRW > 0 && er?.rates?.JPY > 0) {
@@ -95,7 +95,22 @@ jobs:
             return null;
           }
 
-          // Twelve Data /quote 8개씩 분할 호출 (동일 1크레딧으로 현재가+전일대비등락률+고가/저가 동시 확보)
+          // [오픈 CDN] 대표 암호화폐 보충 (이더리움 ETH 및 BTC 백업)
+          async function fetchCoreCrypto() {
+            const fawaz = await fetchJsonWithTimeout(
+              "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json",
+              8000
+            );
+            if (!fawaz?.usd) return {};
+            const result = {};
+            for (const sym of ["BTC", "ETH"]) {
+              const val = Number(fawaz.usd[sym.toLowerCase()]);
+              if (Number.isFinite(val) && val > 0) result[sym] = val;
+            }
+            return result;
+          }
+
+          // [공식 API] Twelve Data /quote 8개씩 분할 호출 (핵심 16개 통화 실시간 시세 + 전일대비 등락률)
           async function fetchTwelveDataQuoteBatch(pairs) {
             const url = `https://api.twelvedata.com/quote?symbol=${pairs.join(",")}&apikey=${process.env.TWELVE_DATA_KEY}`;
             const td = await fetchJsonWithTimeout(url, 10000);
@@ -129,7 +144,7 @@ jobs:
             return { rates, quotes };
           }
 
-          // 3년 치 과거 환율 수집 (신규 frankfurter.dev 및 구 frankfurter.app 2중 호출)
+          // [공식 ECB 데이터] 3년 치 과거 환율 수집
           async function fetchHistory3Y() {
             const end = new Date();
             const start = new Date();
@@ -175,27 +190,41 @@ jobs:
             const isExistingFresh24h = existing?.updated_at_iso && (nowMs - Date.parse(existing.updated_at_iso)) < 24 * 3600 * 1000;
 
             let updatedRates = { ...existingRates };
+            // 이전 테스트에서 남아있을 수 있는 지수 항목 정리
+            delete updatedRates.SPX;
+            delete updatedRates.NDX;
+            delete updatedQuotes.SPX;
+            delete updatedQuotes.NDX;
+
             let baseSource = existing?.base_source || "init";
             let realtimeSource = existing?.realtime_source || null;
             let newLastOerAt = existing?.meta?.last_oer_at || null;
             let newLastTdAt = existing?.meta?.last_td_at || null;
             let didUpdate = false;
 
-            // [슬롯 A: 매시 03분] OER 200개 통화 베이스 갱신
+            // [슬롯 A: 매시 03분] 공식 API로 200개 통화 + 귀금속(XAU, XAG) + BTC/ETH 갱신
             if (isManual || !existing || minsSinceOer >= 50) {
               const oer = await fetchOER();
               if (oer) {
-                updatedRates = safeMergeRates(updatedRates, oer.rates, !existing);
+                updatedRates = safeMergeRates(updatedRates, oer.rates, !existing, 0.25);
                 baseSource = oer.source;
                 newLastOerAt = now.toISOString();
                 didUpdate = true;
               } else if (!isExistingFresh24h) {
                 const fb = await fetchKeylessFallback();
                 if (fb) {
-                  updatedRates = safeMergeRates(updatedRates, fb.rates, !existing);
+                  updatedRates = safeMergeRates(updatedRates, fb.rates, !existing, 0.25);
                   baseSource = fb.source;
                   didUpdate = true;
                 }
+              }
+
+              // 이더리움(ETH) 및 BTC 백업 병합
+              const cryptoRates = await fetchCoreCrypto();
+              if (oer?.rates?.BTC > 0) delete cryptoRates.BTC;
+              if (Object.keys(cryptoRates).length > 0) {
+                updatedRates = safeMergeRates(updatedRates, cryptoRates, !existing, 0.60);
+                didUpdate = true;
               }
             }
 
@@ -214,7 +243,7 @@ jobs:
               const tdCount = Object.keys(mergedTdRates).length;
 
               if (tdCount > 0) {
-                updatedRates = safeMergeRates(updatedRates, mergedTdRates, false);
+                updatedRates = safeMergeRates(updatedRates, mergedTdRates, false, 0.25);
                 updatedQuotes = { ...updatedQuotes, ...mergedTdQuotes };
                 realtimeSource = `TwelveData-20m-Quote(${tdCount})`;
                 newLastTdAt = now.toISOString();
@@ -222,7 +251,7 @@ jobs:
               }
             }
 
-            // 3년 치 과거 차트 데이터
+            // 3년 치 과거 차트 데이터 (파일이 없거나, 수동 실행이거나, 매일 UTC 00시 03분대일 때)
             const hasHistory = fs.existsSync("history_3y.json");
             const isDailyHistorySlot = now.getUTCHours() === 0 && now.getUTCMinutes() < 20;
             if (!hasHistory || isManual || isDailyHistorySlot) {
@@ -250,6 +279,7 @@ jobs:
                 quotes: updatedQuotes
               };
               fs.writeFileSync("latest.json", JSON.stringify(payload));
+              console.log("latest.json 저장 완료 (총 항목:", Object.keys(updatedRates).length, "개)");
             } else {
               console.error("데이터 검증 실패 - 기존 파일 보호");
               process.exit(1);
@@ -259,20 +289,21 @@ jobs:
           run();
           EOF
 
-      - name: Overwrite commit and force push (Keep repo size under 100KB)
+      - name: Commit and push data files safely
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add latest.json
           if [ -f "history_3y.json" ]; then git add history_3y.json; fi
           if ! git diff --cached --quiet; then
-            COMMIT_COUNT=$(git rev-list --count HEAD)
-            if [ "$COMMIT_COUNT" -gt 1 ]; then
+            LAST_AUTHOR=$(git log -1 --pretty=%an)
+            if [ "$LAST_AUTHOR" = "github-actions[bot]" ]; then
               git commit --amend -m "chore: update rates $(date -u +'%Y-%m-%d %H:%M UTC')"
+              git push --force
             else
               git commit -m "chore: update rates $(date -u +'%Y-%m-%d %H:%M UTC')"
+              git push
             fi
-            git push --force
           fi
 
       - name: Purge jsDelivr CDN cache
