@@ -17,7 +17,7 @@ jobs:
         with:
           fetch-depth: 2
 
-      - name: Fetch staggered rates with anti-stale & spike protection
+      - name: Fetch staggered rates & 3-year history
         env:
           OER_APP_ID: ${{ secrets.OER_APP_ID }}
           TWELVE_DATA_KEY: ${{ secrets.TWELVE_DATA_KEY }}
@@ -26,12 +26,12 @@ jobs:
           node << 'EOF'
           const fs = require("fs");
 
-          // 타임아웃 지원 fetch 헬퍼 (지연 서버 대기 방지)
-          async function fetchJsonWithTimeout(url, timeoutMs = 6000) {
+          // 타임아웃 및 자동 리다이렉트 지원 fetch 헬퍼
+          async function fetchJsonWithTimeout(url, timeoutMs = 8000) {
             const controller = new AbortController();
             const timer = setTimeout(() => controller.abort(), timeoutMs);
             try {
-              const res = await fetch(url, { signal: controller.signal });
+              const res = await fetch(url, { signal: controller.signal, redirect: "follow" });
               if (!res.ok) return null;
               return await res.json();
             } catch (e) {
@@ -50,7 +50,7 @@ jobs:
               const prev = merged[cur];
               if (!allowLargeJump && prev > 0) {
                 const ratio = num / prev;
-                if (ratio > 1.25 || ratio < 0.75) continue; // 비정상 스파이크 차단
+                if (ratio > 1.25 || ratio < 0.75) continue;
               }
               merged[cur] = num;
             }
@@ -69,7 +69,7 @@ jobs:
             return null;
           }
 
-          // [2~4순위 무가입 백업] 24시간 주기 (초기 구축 또는 24시간 이상 장기 장애 시에만 사용)
+          // [2~4순위 무가입 백업] 24시간 주기
           async function fetchKeylessFallback() {
             const er = await fetchJsonWithTimeout("https://open.er-api.com/v6/latest/USD");
             if (er?.rates?.KRW > 0 && er?.rates?.JPY > 0) {
@@ -87,7 +87,7 @@ jobs:
               return { source: "3-Fawazahmed0-CDN", rates };
             }
 
-            const ecb = await fetchJsonWithTimeout("https://api.frankfurter.app/latest?from=USD");
+            const ecb = await fetchJsonWithTimeout("https://api.frankfurter.dev/v1/latest?base=USD");
             if (ecb?.rates?.KRW > 0) {
               return { source: "4-ECB-Frankfurter", rates: { USD: 1, ...ecb.rates } };
             }
@@ -95,7 +95,7 @@ jobs:
             return null;
           }
 
-          // Twelve Data 8개씩 분할 호출 (분당 8크레딧 제한 준수)
+          // Twelve Data 8개씩 분할 호출
           async function fetchTwelveDataBatch(pairs) {
             const url = `https://api.twelvedata.com/price?symbol=${pairs.join(",")}&apikey=${process.env.TWELVE_DATA_KEY}`;
             const td = await fetchJsonWithTimeout(url, 8000);
@@ -109,6 +109,31 @@ jobs:
               }
             }
             return result;
+          }
+
+          // 3년 치 과거 환율 수집 (신규 frankfurter.dev 및 구 frankfurter.app 2중 호출)
+          async function fetchHistory3Y() {
+            const end = new Date();
+            const start = new Date();
+            start.setFullYear(end.getFullYear() - 3);
+            const startStr = start.toISOString().slice(0, 10);
+            const endStr = end.toISOString().slice(0, 10);
+
+            const urls = [
+              `https://api.frankfurter.dev/v1/${startStr}..${endStr}?base=USD`,
+              `https://api.frankfurter.app/${startStr}..${endStr}?from=USD`
+            ];
+
+            for (const url of urls) {
+              const data = await fetchJsonWithTimeout(url, 15000);
+              if (data?.rates && Object.keys(data.rates).length > 100) {
+                fs.writeFileSync("history_3y.json", JSON.stringify(data));
+                console.log("history_3y.json 생성 완료:", Object.keys(data.rates).length, "일치 데이터");
+                return true;
+              }
+            }
+            console.warn("history_3y.json 수집 실패 - 다음 주기에 재시도합니다.");
+            return false;
           }
 
           async function run() {
@@ -138,7 +163,7 @@ jobs:
             let newLastTdAt = existing?.meta?.last_td_at || null;
             let didUpdate = false;
 
-            // [슬롯 A: 매시 03분] 직전 OER 수집 후 50분 이상 경과했거나 수동 실행/초기 상태일 때
+            // [슬롯 A: 매시 03분] OER 200개 통화 베이스 갱신
             if (isManual || !existing || minsSinceOer >= 50) {
               const oer = await fetchOER();
               if (oer) {
@@ -147,7 +172,6 @@ jobs:
                 newLastOerAt = now.toISOString();
                 didUpdate = true;
               } else if (!isExistingFresh24h) {
-                // 기존 데이터가 없거나 24시간 이상 오래된 경우에만 무가입 백업으로 갱신 (과거 시세 역행 방지)
                 const fb = await fetchKeylessFallback();
                 if (fb) {
                   updatedRates = safeMergeRates(updatedRates, fb.rates, !existing);
@@ -157,14 +181,14 @@ jobs:
               }
             }
 
-            // [슬롯 B: 매시 23분, 43분] 평일 실시간 16개 핵심 통화 덮어쓰기 (OER 직후 12분 이내 중복 실행 방지)
+            // [슬롯 B: 매시 23분, 43분] 평일 실시간 16개 핵심 통화 덮어쓰기
             const shouldRunTd = process.env.TWELVE_DATA_KEY && !isWeekend && (isManual || (minsSinceOer >= 12 && minsSinceTd >= 15));
             if (shouldRunTd) {
               const batch1 = ["USD/KRW", "USD/IDR", "USD/JPY", "USD/EUR", "USD/VND", "USD/THB", "USD/CNY", "USD/SGD"];
               const batch2 = ["USD/TWD", "USD/PHP", "USD/MYR", "USD/HKD", "USD/GBP", "USD/AUD", "USD/CAD", "USD/CHF"];
 
               const r1 = await fetchTwelveDataBatch(batch1);
-              await new Promise(resolve => setTimeout(resolve, 65000)); // 분당 8크레딧 제한 초기화 대기
+              await new Promise(resolve => setTimeout(resolve, 65000));
               const r2 = await fetchTwelveDataBatch(batch2);
 
               const tdRates = { ...r1, ...r2 };
@@ -177,7 +201,14 @@ jobs:
               }
             }
 
-            // 주말의 :23/:43 타임처럼 실제 갱신된 내용이 없으면 기존 파일을 건드리지 않고 정상 종료
+            // 3년 치 과거 차트 데이터 (파일이 없거나, 수동 실행이거나, 매일 UTC 00시 03분대일 때)
+            const hasHistory = fs.existsSync("history_3y.json");
+            const isDailyHistorySlot = now.getUTCHours() === 0 && now.getUTCMinutes() < 20;
+            if (!hasHistory || isManual || isDailyHistorySlot) {
+              const historyOk = await fetchHistory3Y();
+              if (historyOk) didUpdate = true;
+            }
+
             if (!didUpdate && existing) {
               console.log("새로운 시세 갱신 대상 없음 - 기존 최신 파일을 그대로 유지합니다.");
               process.exit(0);
@@ -205,24 +236,6 @@ jobs:
 
           run();
           EOF
-
-          # 3년 치 과거 차트 데이터 (하루 1번 UTC 00시 03분대에만 갱신)
-          CURRENT_HOUR=$(date -u +%H)
-          CURRENT_MIN=$(date -u +%M)
-          if [ ! -f "history_3y.json" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ] || { [ "$CURRENT_HOUR" = "00" ] && [ "$CURRENT_MIN" -lt "20" ]; }; then
-            START_DATE=$(date -u -d "3 years ago" +%Y-%m-%d)
-            END_DATE=$(date -u +%Y-%m-%d)
-            curl -s "https://api.frankfurter.app/${START_DATE}..${END_DATE}?from=USD" -o temp_history.json
-            node -e '
-              const fs = require("fs");
-              try {
-                const d = JSON.parse(fs.readFileSync("temp_history.json", "utf8"));
-                if (d?.rates && Object.keys(d.rates).length > 100) {
-                  fs.writeFileSync("history_3y.json", JSON.stringify(d));
-                }
-              } catch (e) {}
-            '
-          fi
 
       - name: Overwrite commit and force push (Keep repo size under 100KB)
         run: |
