@@ -8,6 +8,11 @@ on:
 permissions:
   contents: write
 
+# 실행이 겹치면(TwelveData 대기 65초 + 강제 푸시) 서로 덮어쓸 수 있어 한 번에 하나만 돈다. 진행 중인 것은 끝까지 두고 다음 것을 기다린다.
+concurrency:
+  group: update-rates
+  cancel-in-progress: false
+
 jobs:
   fetch-rates:
     runs-on: ubuntu-latest
@@ -290,23 +295,49 @@ jobs:
           EOF
 
       - name: Commit and push data files safely
+        id: commit
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add latest.json
           if [ -f "history_3y.json" ]; then git add history_3y.json; fi
-          if ! git diff --cached --quiet; then
+          if git diff --cached --quiet; then
+            echo "변경 없음 - 커밋/푸시/캐시 비우기를 건너뜁니다."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
             LAST_AUTHOR=$(git log -1 --pretty=%an)
             if [ "$LAST_AUTHOR" = "github-actions[bot]" ]; then
               git commit --amend -m "chore: update rates $(date -u +'%Y-%m-%d %H:%M UTC')"
-              git push --force
+              git push --force-with-lease
             else
               git commit -m "chore: update rates $(date -u +'%Y-%m-%d %H:%M UTC')"
               git push
             fi
+            echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Purge jsDelivr CDN cache
+      # 푸시한 뒤 jsDelivr 캐시를 비우고, 정말 새 값이 나가는지 확인한다. 안 나가면 다시 비우고(최대 5회), 끝내 안 되면 빨간 실패로 표시한다.
+      # (예전에는 결과를 버려서 비우기가 실패해도 아무도 몰랐고, 앱에는 며칠 전 환율이 그대로 보였다)
+      - name: Purge jsDelivr CDN cache and verify
+        if: steps.commit.outputs.changed == 'true'
+        env:
+          REPO: ${{ github.repository }}
         run: |
-          curl -s "https://purge.jsdelivr.net/gh/${{ github.repository }}@main/latest.json" > /dev/null
-          curl -s "https://purge.jsdelivr.net/gh/${{ github.repository }}@main/history_3y.json" > /dev/null
+          EXPECT=$(node -p "JSON.parse(require('fs').readFileSync('latest.json','utf8')).updated_at_iso")
+          echo "새 파일의 updated_at_iso = $EXPECT"
+          for i in 1 2 3 4 5; do
+            echo "--- 캐시 비우기 시도 $i"
+            curl -sS --max-time 20 "https://purge.jsdelivr.net/gh/${REPO}@main/latest.json" || true
+            echo
+            curl -sS --max-time 20 "https://purge.jsdelivr.net/gh/${REPO}@main/history_3y.json" || true
+            echo
+            sleep 20
+            GOT=$(curl -sS --max-time 20 "https://cdn.jsdelivr.net/gh/${REPO}@main/latest.json" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{console.log(JSON.parse(s).updated_at_iso)}catch(e){console.log("parse-error")}})' || echo "fetch-error")
+            echo "CDN이 주는 값 = $GOT"
+            if [ "$GOT" = "$EXPECT" ]; then
+              echo "OK: CDN이 최신 값을 줍니다."
+              exit 0
+            fi
+          done
+          echo "::error::jsDelivr 가 5번 비운 뒤에도 옛 파일을 줍니다 (기대 $EXPECT, 실제 $GOT)."
+          exit 1
