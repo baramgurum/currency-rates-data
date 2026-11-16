@@ -2,7 +2,9 @@ name: Update Exchange Rates & Core Assets (Official APIs Only)
 
 on:
   schedule:
-    - cron: '3,23,43 * * * *' # 매시 03분(OER 200통화·귀금속 + ETH), 23분·43분(TwelveData 16통화 실시간·등락률)
+    # GitHub 예약 실행은 서버가 붐비면 늦어지거나 통째로 건너뛰어진다. 10분마다 깨워 두고, 실제 갱신 여부는 스크립트가 직접 판단한다
+    # (OER 200통화·귀금속 + ETH 는 마지막 갱신 후 50분, TwelveData 16통화 실시간·등락률은 15분이 지났을 때만). 정시(0분)는 가장 붐비므로 피했다.
+    - cron: '3,13,23,33,43,53 * * * *'
   workflow_dispatch:
 
 permissions:
